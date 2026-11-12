@@ -1,9 +1,10 @@
-
 import streamlit as st
 import json
 import os
 import uuid
+import re
 from datetime import date
+from supabase import create_client
 
 # =========================
 # 基本設定
@@ -14,6 +15,178 @@ st.set_page_config(
     page_icon="📚",
     layout="wide"
 )
+
+# =========================
+# Supabase接続
+# =========================
+
+supabase = create_client(
+    st.secrets["SUPABASE_URL"],
+    st.secrets["SUPABASE_KEY"]
+)
+
+
+# ログイン状態を復元
+if st.session_state.get("logged_in") and st.session_state.get("auth_tokens"):
+    try:
+        supabase.auth.set_session(
+            st.session_state.auth_tokens["access_token"],
+            st.session_state.auth_tokens["refresh_token"]
+        )
+    except Exception:
+        st.session_state.logged_in = False
+        st.session_state.pop("auth_tokens", None)
+        st.session_state.pop("user_id", None)
+
+
+# =========================
+# ログイン・新規登録
+# =========================
+
+def username_to_email(username):
+    # ユーザーIDを内部用のメール形式に変換
+    return username.lower() + "@login.taskmanager.local"
+
+
+def login_screen():
+
+    st.title("📚 課題管理アプリ")
+
+    login_tab, signup_tab = st.tabs([
+        "ログイン",
+        "新規登録"
+    ])
+
+    with login_tab:
+
+        st.subheader("ログイン")
+
+        username = st.text_input(
+            "ユーザーID",
+            key="login_username"
+        )
+
+        password = st.text_input(
+            "パスワード",
+            type="password",
+            key="login_password"
+        )
+
+        if st.button("ログイン", use_container_width=True):
+
+            if not username or not password:
+                st.warning("ユーザーIDとパスワードを入力してください。")
+
+            else:
+                try:
+                    email = username_to_email(username)
+
+                    result = supabase.auth.sign_in_with_password({
+                        "email": email,
+                        "password": password
+                    })
+
+                    st.session_state.auth_tokens = {
+                        "access_token": result.session.access_token,
+                        "refresh_token": result.session.refresh_token
+                    }
+
+                    st.session_state.user_id = result.user.id
+                    st.session_state.logged_in = True
+
+                    st.rerun()
+
+                except Exception:
+                    st.error("ユーザーIDまたはパスワードが違います。")
+
+    with signup_tab:
+
+        st.subheader("新規登録")
+
+        new_username = st.text_input(
+            "ユーザーID（3〜20文字・英数字と_）",
+            key="signup_username"
+        )
+
+        new_password = st.text_input(
+            "パスワード（8文字以上）",
+            type="password",
+            key="signup_password"
+        )
+
+        confirm_password = st.text_input(
+            "パスワード（確認用）",
+            type="password",
+            key="confirm_password"
+        )
+
+        if st.button("アカウントを作成", use_container_width=True):
+
+            if not re.fullmatch(r"[a-zA-Z0-9_]{3,20}", new_username):
+                st.error("ユーザーIDは半角英数字と_で3〜20文字にしてください。")
+
+            elif len(new_password) < 8:
+                st.error("パスワードは8文字以上にしてください。")
+
+            elif new_password != confirm_password:
+                st.error("パスワードが一致しません。")
+
+            else:
+                try:
+                    email = username_to_email(new_username)
+
+                    result = supabase.auth.sign_up({
+                        "email": email,
+                        "password": new_password
+                    })
+
+                    if result.session is None:
+                        st.error("登録できませんでした。Supabaseのメール確認設定を確認してください。")
+
+                    else:
+                        st.session_state.auth_tokens = {
+                            "access_token": result.session.access_token,
+                            "refresh_token": result.session.refresh_token
+                        }
+
+                        st.session_state.user_id = result.user.id
+                        st.session_state.logged_in = True
+
+                        st.success("アカウントを作成しました！")
+                        st.rerun()
+
+                except Exception as e:
+                    st.error(f"登録エラー：{e}")
+
+                    # =========================
+# ログイン状態の確認
+# =========================
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if not st.session_state.logged_in:
+    login_screen()
+    st.stop()
+
+
+# =========================
+# ログアウト
+# =========================
+
+if st.sidebar.button("ログアウト", use_container_width=True):
+    try:
+        supabase.auth.sign_out()
+    except Exception:
+        pass
+
+    st.session_state.logged_in = False
+    st.session_state.pop("auth_tokens", None)
+    st.session_state.pop("user_id", None)
+    st.session_state.pop("tasks", None)
+
+    st.rerun()
+
 
 DATA_FILE = "tasks.json"
 
@@ -33,13 +206,17 @@ def calculate_progress(task):
 
     return min(100, max(0, actual / estimated * 100))
 
-def load_tasks():
-    if not os.path.exists(DATA_FILE):
-        return []
 
+def load_tasks():
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            tasks = json.load(f)
+        result = (
+            supabase.table("tasks")
+            .select("data")
+            .eq("user_id", st.session_state.user_id)
+            .execute()
+        )
+
+        tasks = [row["data"] for row in result.data]
 
         for task in tasks:
             task.setdefault("id", str(uuid.uuid4()))
@@ -51,29 +228,45 @@ def load_tasks():
             task.setdefault("logs", [])
             task.setdefault("completion_prompt_dismissed", False)
 
-            # 時間から計算した進捗率
             base = calculate_progress(task)
 
-            # 以前の手動進捗率を引き継ぐ
             if "progress_adjustment" not in task:
                 old_progress = float(task.get("progress", base))
                 task["progress_adjustment"] = old_progress - base
 
         return tasks
 
-    except (json.JSONDecodeError, OSError):
-        st.error("tasks.jsonを読み込めませんでした。")
+    except Exception as e:
+        st.error(f"課題データの読み込みに失敗しました：{e}")
         return []
 
 
+
 def save_tasks():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(
-            st.session_state.tasks,
-            f,
-            ensure_ascii=False,
-            indent=4
-        )
+    try:
+        user_id = st.session_state.user_id
+
+        # このユーザーの既存データを削除
+        supabase.table("tasks").delete().eq(
+            "user_id", user_id
+        ).execute()
+
+        # 現在の課題を保存
+        if st.session_state.tasks:
+            records = [
+                {
+                    "id": task["id"],
+                    "user_id": user_id,
+                    "data": task
+                }
+                for task in st.session_state.tasks
+            ]
+
+            supabase.table("tasks").insert(records).execute()
+
+    except Exception as e:
+        st.error(f"課題データの保存に失敗しました：{e}")
+
 
 
 if "tasks" not in st.session_state:
